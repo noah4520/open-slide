@@ -41,10 +41,9 @@ export function useNotes(slideId: string, index: number, initial: string | undef
   const lastSavedRef = useRef(initialText);
   const dirtyRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const inflightRef = useRef<AbortController | null>(null);
+  const inflightRef = useRef(new Map<string, AbortController>());
   const targetRef = useRef<Target>({ slideId, index });
   const valueRef = useRef(value);
-  valueRef.current = value;
 
   const cancelTimer = useCallback(() => {
     if (timerRef.current != null) {
@@ -54,9 +53,10 @@ export function useNotes(slideId: string, index: number, initial: string | undef
   }, []);
 
   const persist = useCallback(async (target: Target, text: string) => {
-    inflightRef.current?.abort();
+    const key = cacheKey(target.slideId, target.index);
+    inflightRef.current.get(key)?.abort();
     const ctl = new AbortController();
-    inflightRef.current = ctl;
+    inflightRef.current.set(key, ctl);
     setStatus({ kind: 'saving' });
     try {
       const res = await fetch('/__notes', {
@@ -67,16 +67,23 @@ export function useNotes(slideId: string, index: number, initial: string | undef
       });
       const body = (await res.json().catch(() => ({}))) as { error?: string };
       if (!res.ok) throw new Error(body.error ?? `PUT /__notes → ${res.status}`);
-      sessionCache.set(cacheKey(target.slideId, target.index), text);
-      if (inflightRef.current !== ctl) return;
+      if (inflightRef.current.get(key) !== ctl || ctl.signal.aborted) return;
+      sessionCache.set(key, text);
+      // Returning to the same page starts a new editing session.
+      if (targetRef.current !== target) return;
       lastSavedRef.current = text;
-      dirtyRef.current = false;
-      setStatus({ kind: 'saved' });
+      dirtyRef.current = valueRef.current !== text;
+      setStatus({ kind: dirtyRef.current ? 'idle' : 'saved' });
     } catch (err) {
-      if ((err as { name?: string }).name === 'AbortError') return;
+      if (
+        (err as { name?: string }).name === 'AbortError' ||
+        inflightRef.current.get(key) !== ctl ||
+        targetRef.current !== target
+      )
+        return;
       setStatus({ kind: 'error', message: String((err as Error).message ?? err) });
     } finally {
-      if (inflightRef.current === ctl) inflightRef.current = null;
+      if (inflightRef.current.get(key) === ctl) inflightRef.current.delete(key);
     }
   }, []);
 
@@ -92,36 +99,42 @@ export function useNotes(slideId: string, index: number, initial: string | undef
   useEffect(() => {
     const prev = targetRef.current;
     const targetChanged = prev.slideId !== slideId || prev.index !== index;
+    const key = cacheKey(slideId, index);
+    if (!targetChanged && (dirtyRef.current || inflightRef.current.has(key))) return;
     if (targetChanged && dirtyRef.current) {
       cancelTimer();
       const pending = valueRef.current;
-      if (lastSavedRef.current !== pending) void persist(prev, pending);
+      void persist(prev, pending);
     }
     targetRef.current = { slideId, index };
     cancelTimer();
-    setValueState(initialText);
-    lastSavedRef.current = initialText;
+    const next = sessionCache.get(key) ?? initial ?? '';
+    setValueState(next);
+    valueRef.current = next;
+    lastSavedRef.current = next;
     dirtyRef.current = false;
     setStatus({ kind: 'idle' });
-  }, [slideId, index, initialText, persist, cancelTimer]);
+  }, [slideId, index, initial, persist, cancelTimer]);
 
   useEffect(() => {
     return () => {
       cancelTimer();
-      inflightRef.current?.abort();
+      for (const ctl of inflightRef.current.values()) ctl.abort();
+      inflightRef.current.clear();
     };
   }, [cancelTimer]);
 
   const setValue = useCallback(
     (next: string) => {
       setValueState(next);
-      dirtyRef.current = next !== lastSavedRef.current;
-      cancelTimer();
-      if (!dirtyRef.current) {
-        setStatus({ kind: 'idle' });
-        return;
-      }
+      valueRef.current = next;
       const target = targetRef.current;
+      dirtyRef.current =
+        next !== lastSavedRef.current ||
+        inflightRef.current.has(cacheKey(target.slideId, target.index));
+      cancelTimer();
+      setStatus({ kind: 'idle' });
+      if (!dirtyRef.current) return;
       timerRef.current = setTimeout(() => {
         timerRef.current = null;
         void persist(target, next);
